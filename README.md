@@ -52,6 +52,14 @@ The system measures electrical and environmental parameters and displays live da
 
 ---
 
+## Demo Video
+
+Watch the project demonstration here:
+
+https://youtu.be/NaiSuKad2f0
+
+---
+
 ## Author
 
 Mohammed Hisham

@@ -1,0 +1,540 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
+
+// ================= WIFI =================
+const char* ssid = "ESP32-DASH";
+const char* password = "12345678";
+
+// ================= RELAYS ACTIVE LOW =================
+const uint8_t relayPins[2] = {25, 26};
+bool relayState[2] = {false, false};
+
+// ================= VOLTAGE DIVIDER =================
+#define VOLTAGE_PIN 35
+const float ADC_REF = 3.3f;
+const float ADC_MAX = 4095.0f;
+const float VOLTAGE_DIVIDER_RATIO = 11.0f;
+
+// Show small voltages instead of forcing them to zero
+const float MIN_VALID_VOLTAGE = 0.05f;
+
+// ================= ACS758 CURRENT SENSOR =================
+#define ACS_PIN 32
+const float ACS_OUT_TO_ADC_RATIO = 2.0f / 3.0f;
+const float ACS758_SENSITIVITY_V_PER_A = 0.040f;
+
+float acsZeroSensorVoltage = 2.5f;
+const float ACS_DEADBAND_A = 0.10f;
+
+// ================= DS18B20 =================
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+
+// ================= HALL RPM SENSOR =================
+#define HALL_PIN 34
+
+volatile unsigned long lastPulseMicros = 0;
+volatile unsigned long pulseIntervalMicros = 0;
+volatile bool newPulse = false;
+
+float rpm = 0.0f;
+const float pulsesPerRevolution = 1.0f;
+const unsigned long rpmTimeoutMs = 2000;
+unsigned long lastPulseMillis = 0;
+
+// ================= SENSOR CACHE =================
+float busVoltage = 0.0f;
+float currentA = 0.0f;
+float powerW = 0.0f;
+float alternatorTempC = -127.0f;
+
+// ================= TIMING =================
+unsigned long lastSensorMs = 0;
+const unsigned long sensorIntervalMs = 200;
+
+// ================= WEB SERVER =================
+WebServer server(80);
+
+// ================= HALL ISR =================
+void IRAM_ATTR hallISR() {
+  unsigned long now = micros();
+
+  if (now - lastPulseMicros > 3000) {
+    pulseIntervalMicros = now - lastPulseMicros;
+    lastPulseMicros = now;
+    newPulse = true;
+  }
+}
+
+// ================= HELPERS =================
+float safeFloat(float x, float fallback = 0.0f) {
+  if (isnan(x) || isinf(x)) return fallback;
+  return x;
+}
+
+String jsonNumber(float x, unsigned int decimals, float fallback = 0.0f) {
+  x = safeFloat(x, fallback);
+  return String((double)x, decimals);
+}
+
+void sendNoCacheHeaders() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+}
+
+// ================= VOLTAGE =================
+float readVoltageDivider() {
+  const int samples = 40;
+  long total = 0;
+
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(VOLTAGE_PIN);
+    delayMicroseconds(500);
+  }
+
+  float raw = total / (float)samples;
+
+  if (raw < 2) {
+    return 0.0f;
+  }
+
+  float adcVoltage = (raw / ADC_MAX) * ADC_REF;
+  float systemVoltage = adcVoltage * VOLTAGE_DIVIDER_RATIO;
+
+  if (systemVoltage < MIN_VALID_VOLTAGE) {
+    systemVoltage = 0.0f;
+  }
+
+  return safeFloat(systemVoltage, 0.0f);
+}
+
+// ================= ACS758 =================
+float readACS758SensorVoltage() {
+  const int samples = 200;
+  long total = 0;
+
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(ACS_PIN);
+    delayMicroseconds(300);
+  }
+
+  float raw = total / (float)samples;
+  float adcPinVoltage = (raw / ADC_MAX) * ADC_REF;
+  float sensorOutVoltage = adcPinVoltage / ACS_OUT_TO_ADC_RATIO;
+
+  return safeFloat(sensorOutVoltage, 0.0f);
+}
+
+void calibrateACS758Zero() {
+  Serial.println("Calibrating ACS758 zero...");
+  delay(1000);
+
+  const int rounds = 12;
+  float total = 0.0f;
+
+  for (int i = 0; i < rounds; i++) {
+    total += readACS758SensorVoltage();
+    delay(50);
+  }
+
+  acsZeroSensorVoltage = total / rounds;
+  acsZeroSensorVoltage = safeFloat(acsZeroSensorVoltage, 2.5f);
+
+  Serial.print("ACS758 zero voltage = ");
+  Serial.println(acsZeroSensorVoltage, 4);
+}
+
+float readACS758CurrentA() {
+  float sensorOutVoltage = readACS758SensorVoltage();
+
+  float amps =
+    (sensorOutVoltage - acsZeroSensorVoltage) /
+    ACS758_SENSITIVITY_V_PER_A;
+
+  amps = safeFloat(amps, 0.0f);
+
+  if (fabs(amps) < ACS_DEADBAND_A) {
+    amps = 0.0f;
+  }
+
+  if (amps < 0) amps = -amps;
+
+  return amps;
+}
+
+// ================= SENSOR UPDATE =================
+void updateSensors() {
+  currentA = readACS758CurrentA();
+
+  busVoltage = readVoltageDivider();
+
+  powerW = busVoltage * currentA;
+  powerW = safeFloat(powerW, 0.0f);
+
+  ds18b20.requestTemperatures();
+
+  float t0 = ds18b20.getTempCByIndex(0);
+
+  alternatorTempC =
+    (t0 == DEVICE_DISCONNECTED_C || isnan(t0) || isinf(t0))
+    ? -127.0f
+    : t0;
+
+  noInterrupts();
+
+  unsigned long interval = pulseIntervalMicros;
+  bool hasNewPulse = newPulse;
+  newPulse = false;
+
+  interrupts();
+
+  if (hasNewPulse && interval > 0) {
+    rpm =
+      (60.0f * 1000000.0f) /
+      (interval * pulsesPerRevolution);
+
+    lastPulseMillis = millis();
+  }
+
+  if (millis() - lastPulseMillis > rpmTimeoutMs) {
+    rpm = 0.0f;
+  }
+
+  rpm = safeFloat(rpm, 0.0f);
+}
+
+// ================= DASHBOARD =================
+String dashboard() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wind Turbine Monitor</title>
+
+<style>
+body{
+  margin:0;
+  font-family:Arial;
+  background:#111;
+  color:white;
+}
+
+h2{
+  text-align:center;
+  padding:18px;
+  margin:0;
+  background:#000;
+  color:white;
+  font-size:34px;
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:12px;
+  padding:12px;
+}
+
+.card{
+  background:#555;
+  border-radius:16px;
+  padding:20px;
+  text-align:center;
+  font-size:22px;
+}
+
+.full{
+  margin:12px;
+}
+
+.value{
+  font-size:34px;
+  font-weight:bold;
+}
+
+button{
+  border:none;
+  border-radius:16px;
+  padding:20px;
+  font-size:22px;
+  color:white;
+  width:100%;
+}
+
+.on{
+  background:#111;
+  border:2px solid white;
+}
+
+.off{
+  background:#777;
+}
+
+.action{
+  background:#333;
+  margin:12px;
+  width:calc(100% - 24px);
+}
+</style>
+</head>
+
+<body>
+
+<h2>Wind Turbine Monitor</h2>
+
+<div class="grid">
+  <div class="card">
+    Voltage<br>
+    <span class="value" id="v">--</span> V
+  </div>
+
+  <div class="card">
+    Current<br>
+    <span class="value" id="c">--</span> A
+  </div>
+</div>
+
+<div class="card full">
+  Power<br>
+  <span class="value" id="p">--</span> W
+</div>
+
+<div class="grid">
+  <div class="card">
+    RPM<br>
+    <span class="value" id="rpm">--</span>
+  </div>
+
+  <div class="card">
+    Alternator<br>
+    <span class="value" id="ta">--</span> °C
+  </div>
+</div>
+
+<div class="grid">
+  <button id="r0" class="off" onclick="toggleRelay(0)">
+    Relay 1<br>OFF
+  </button>
+
+  <button id="r1" class="off" onclick="toggleRelay(1)">
+    Relay 2<br>OFF
+  </button>
+</div>
+
+<button class="action" onclick="zeroCurrent()">
+  Zero Current Calibration
+</button>
+
+<script>
+function setRelayButton(i, state){
+  const b = document.getElementById('r' + i);
+  b.className = state ? 'on' : 'off';
+  b.innerHTML =
+    'Relay ' + (i + 1) + '<br>' +
+    (state ? 'ON' : 'OFF');
+}
+
+function toggleRelay(r){
+  fetch('/toggle?r=' + r, {cache:'no-store'})
+    .then(res => res.json())
+    .then(d => setRelayButton(d.r, !!d.s));
+}
+
+function zeroCurrent(){
+  fetch('/zero', {cache:'no-store'});
+}
+
+function fmtTemp(x){
+  if (typeof x !== 'number' || !isFinite(x))
+    return 'ERR';
+
+  if (x <= -126.0)
+    return 'ERR';
+
+  return x.toFixed(1);
+}
+
+function fmtNum(x, digits){
+  if (typeof x !== 'number' || !isFinite(x))
+    return '--';
+
+  return x.toFixed(digits);
+}
+
+function updateData(){
+  fetch('/data', {cache:'no-store'})
+    .then(res => res.json())
+    .then(d => {
+      document.getElementById('v').innerText =
+        fmtNum(d.v, 2);
+
+      document.getElementById('c').innerText =
+        fmtNum(d.c, 2);
+
+      document.getElementById('p').innerText =
+        fmtNum(d.p, 2);
+
+      document.getElementById('rpm').innerText =
+        fmtNum(d.rpm, 0);
+
+      document.getElementById('ta').innerText =
+        fmtTemp(d.ta);
+
+      setRelayButton(0, !!d.r0);
+      setRelayButton(1, !!d.r1);
+    });
+}
+
+setInterval(updateData, 500);
+window.onload = updateData;
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// ================= ROUTES =================
+void handleRoot() {
+  sendNoCacheHeaders();
+  server.send(200, "text/html; charset=utf-8", dashboard());
+}
+
+void handleToggle() {
+  if (!server.hasArg("r")) {
+    sendNoCacheHeaders();
+    server.send(400, "text/plain", "Bad Request");
+    return;
+  }
+
+  int r = server.arg("r").toInt();
+
+  if (r < 0 || r > 1) {
+    sendNoCacheHeaders();
+    server.send(400, "text/plain", "Bad Relay");
+    return;
+  }
+
+  relayState[r] = !relayState[r];
+
+  digitalWrite(
+    relayPins[r],
+    relayState[r] ? LOW : HIGH
+  );
+
+  String json = "{";
+  json += "\"r\":" + String(r) + ",";
+  json += "\"s\":" + String(relayState[r] ? 1 : 0);
+  json += "}";
+
+  sendNoCacheHeaders();
+  server.send(200, "application/json", json);
+}
+
+void handleZero() {
+  calibrateACS758Zero();
+  sendNoCacheHeaders();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"v\":" + jsonNumber(busVoltage, 2) + ",";
+  json += "\"c\":" + jsonNumber(currentA, 2) + ",";
+  json += "\"p\":" + jsonNumber(powerW, 2) + ",";
+  json += "\"rpm\":" + jsonNumber(rpm, 0) + ",";
+  json += "\"ta\":" + String(alternatorTempC, 1) + ",";
+  json += "\"r0\":" + String(relayState[0] ? 1 : 0) + ",";
+  json += "\"r1\":" + String(relayState[1] ? 1 : 0);
+  json += "}";
+
+  sendNoCacheHeaders();
+  server.send(200, "application/json", json);
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  for (int i = 0; i < 2; i++) {
+    pinMode(relayPins[i], OUTPUT);
+    relayState[i] = false;
+    digitalWrite(relayPins[i], HIGH);
+  }
+
+  pinMode(VOLTAGE_PIN, INPUT);
+  pinMode(ACS_PIN, INPUT);
+
+  analogSetPinAttenuation(VOLTAGE_PIN, ADC_11db);
+  analogSetPinAttenuation(ACS_PIN, ADC_11db);
+
+  ds18b20.begin();
+
+  Serial.print("Temp sensors found: ");
+  Serial.println(ds18b20.getDeviceCount());
+
+  pinMode(HALL_PIN, INPUT);
+
+  attachInterrupt(
+    digitalPinToInterrupt(HALL_PIN),
+    hallISR,
+    FALLING
+  );
+
+  calibrateACS758Zero();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+
+  Serial.print("Dashboard IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  updateSensors();
+  lastSensorMs = millis();
+
+  server.on("/", handleRoot);
+  server.on("/toggle", handleToggle);
+  server.on("/data", handleData);
+  server.on("/zero", handleZero);
+
+  server.begin();
+
+  Serial.println("Web server started");
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastSensorMs >= sensorIntervalMs) {
+    updateSensors();
+    lastSensorMs = millis();
+
+    Serial.print("V=");
+    Serial.print(busVoltage, 2);
+
+    Serial.print("V  I=");
+    Serial.print(currentA, 2);
+
+    Serial.print("A  P=");
+    Serial.print(powerW, 2);
+
+    Serial.print("W  RPM=");
+    Serial.print(rpm, 0);
+
+    Serial.print("  ALT=");
+    Serial.print(alternatorTempC, 1);
+
+    Serial.println("C");
+  }
+}

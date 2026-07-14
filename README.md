@@ -1,2 +1,56 @@
-# Wind-Turbine-Monitoring-System
-ESP32-based IoT monitoring system for a vertical-axis wind turbine featuring real-time voltage, current, power, RPM, temperature monitoring, and web dashboard.
+# Wind Turbine Monitoring System
+
+## Overview
+
+The Wind Turbine Monitoring System is an ESP32-based IoT solution designed to monitor the performance of a prototype vertical-axis wind turbine in real time.
+
+The system measures electrical and environmental parameters and displays live data through a built-in web dashboard.
+
+---
+
+## Features
+
+- Real-time Voltage Monitoring
+- Current Monitoring
+- Power Calculation
+- RPM Measurement
+- Temperature Monitoring
+- Battery Monitoring
+- Wi-Fi Web Dashboard
+
+---
+
+## Hardware
+
+- ESP32 DevKit
+- ACS758 Current Sensor
+- Hall Effect Sensor
+- DS18B20 Temperature Sensor
+- Voltage Divider
+- Vertical Axis Wind Turbine Prototype
+
+---
+
+## Software
+
+- Arduino IDE
+- Embedded C++
+- HTML Dashboard
+
+---
+
+## Technologies
+
+- ESP32
+- C++
+- Wi-Fi
+- HTML
+- ACS758
+- DS18B20
+- Hall Sensor
+
+---
+
+## Author
+
+Mohammed Hisham
